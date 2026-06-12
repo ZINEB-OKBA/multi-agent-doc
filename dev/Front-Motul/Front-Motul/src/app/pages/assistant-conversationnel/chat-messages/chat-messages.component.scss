@@ -1,0 +1,17 @@
+.chat-messages {
+  overflow-y: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  padding: 0 0 4rem 0;
+}
+
+.chat-messages::-webkit-scrollbar {
+  display: none;
+}
+.msg{
+  max-width: 80%;
+}
+
+.resize-none{
+  resize: none;
+}
