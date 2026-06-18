@@ -12,18 +12,21 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger       = logging.getLogger(__name__)
-CHUNK_SIZE   = 2000
-CHUNK_OVERLAP = 300
+CHUNK_SIZE   = 800
+CHUNK_OVERLAP = 200
 
 
 def _load_pdf(file_path: str) -> List[Document]:
-    from langchain_community.document_loaders import PyPDFLoader
-    logger.info(f"📄 PDF : {file_path}")
-    docs = PyPDFLoader(file_path).load()
+    # 🎯 Remplacement par PyMuPDFLoader pour mieux gérer la mise en page en colonnes
+    from langchain_community.document_loaders import PyMuPDFLoader
+    logger.info(f"📄 PDF (Extraction avancée) : {file_path}")
+    
+    docs = PyMuPDFLoader(file_path).load()
+    
     # Ajoute le nom du fichier dans les métadonnées
     for d in docs:
         d.metadata["source"] = Path(file_path).name
-    logger.info(f"   → {len(docs)} page(s)")
+    logger.info(f"   → {len(docs)} page(s) extraite(s)")
     return docs
 
 

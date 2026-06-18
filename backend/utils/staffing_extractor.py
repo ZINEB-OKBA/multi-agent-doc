@@ -12,7 +12,7 @@ Structure cible retournée (liste de dicts) :
     "projet":     "Projet Alpha",
     "mois":       "2024-03",        # YYYY-MM
     "jours":      18,               # jours travaillés ce mois
-    "tjm":        650.0,            # Taux Journalier Moyen (€)
+    "tjm":        650.0,            # Taux Journalier Moyen (dhs)
     "cout":       11700.0,          # jours × tjm
     "facturable": True              # le mois est-il facturable ?
   },
@@ -37,12 +37,12 @@ logger = logging.getLogger(__name__)
 
 # Colonnes reconnues (insensible à la casse, accents tolérés)
 _COL_MAP = {
-    "employe":    ["employe", "employé", "nom", "collaborateur", "name", "employee"],
-    "projet":     ["projet", "project", "affaire", "mission"],
-    "mois":       ["mois", "month", "periode", "période", "date"],
-    "jours":      ["jours", "nb_jours", "nb jours", "jours travaillés", "days", "worked_days"],
-    "tjm":        ["tjm", "taux", "taux journalier", "daily_rate", "rate"],
-    "facturable": ["facturable", "billable", "facturé"],
+ "employe":    ["freelancer_id", "employee_id", "employe", "collaborateur"],
+    "projet":     ["job_category", "projet", "project", "project_type"], # Le métier devient le projet
+    "mois":       ["payment_method", "mois", "month"],
+    "jours":      ["job_duration_days", "jours", "days"],
+    "tjm":        ["hourly_rate", "tjm", "rate"],
+    "facturable": ["facturable", "billable"],
 }
 
 

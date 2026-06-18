@@ -176,7 +176,7 @@ def run_staffing_agent(
     # ── 6. Appeler le LLM avec la synthèse ────────────────────────
     synthese = analysis.get("synthese", "")
     try:
-        llm   = get_llm(temperature=0.1, max_tokens=2048)
+        llm   = get_llm(temperature=0, max_tokens=2048)
         chain = STAFFING_PROMPT | llm | StrOutputParser()
         answer = chain.invoke({"synthese": synthese, "question": question})
     except Exception as e:

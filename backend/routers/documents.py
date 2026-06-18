@@ -71,7 +71,17 @@ def _update_postgres_status(doc_id: int, is_indexed: bool, indexing: bool, error
 # ══════════════════════════════════════════════════════════════════════════════
 # ENPOINT UNIQUE D'INGESTION ET D'INDEXATION SYNCHRONE
 # ══════════════════════════════════════════════════════════════════════════════
-
+# Test à ajouter dans chat_rest() ou via Swagger
+@router.post("/debug/search")
+async def debug_search(body: dict):
+    from utils.orchestrator import get_project_resources
+    project_id = body.get("project_id")
+    query = body.get("query", "directeur général EMSI")
+    vs, _, _ = get_project_resources(project_id)
+    if vs:
+        docs = vs.similarity_search(query, k=10)
+        return [{"source": d.metadata.get("source"), "content": d.page_content[:200]} for d in docs]
+    return {"error": "Pas de vectorstore"}
 @router.post("/backoffice/receive-and-index", response_model=IndexSyncResponse, status_code=status.HTTP_200_OK)
 async def receive_and_index_synchronous(payload: SpringBootUploadPayload):
     """
@@ -104,8 +114,8 @@ async def receive_and_index_synchronous(payload: SpringBootUploadPayload):
         # Étape 2 : Appel synchrone de l'orchestrateur
         # Cette fonction va lire PostgreSQL, décoder les fichiers en RAM, calculer les embeddings via Ollama,
         # puis monter et stocker les structures de données chaudes dans le RAM_PROJECTS_CACHE global.
-        vectorstore, dataframes = rebuild_resources_from_postgres(project_id)
-        
+        # The *_ catches any extra variables returned at the end dynamically!
+        vectorstore, dataframes, *_ = rebuild_resources_from_postgres(project_id)
         # Étape 3 : Évaluation du volume indexé
         chunks_count = 0
         if file_type == "pdf" and vectorstore:

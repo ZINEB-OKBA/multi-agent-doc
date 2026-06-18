@@ -9,14 +9,13 @@ Extraction et décodage à la volée des Base64 depuis la RAM (Cache).
 import json
 import logging
 import re
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.websockets import WebSocketState
 from pydantic import BaseModel
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from typing import List, Optional
 
 from utils.orchestrator import orchestrate, get_project_resources
 
@@ -51,6 +50,8 @@ class ChatResponse(BaseModel):
     agent_used: str
     intent:     str
     sources:    List[SourceReference] = []  # Liste des sources citées dans la réponse
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FONCTION POLYMOPHE DE RÉSOLUTION D'ID PAR LE NOM
 # ══════════════════════════════════════════════════════════════════════════════
@@ -93,7 +94,6 @@ def _extract_project_id(project_str: str) -> int:
         logger.error(f"❌ Erreur lors de la résolution flexible du projet '{project_str}' : {e}")
 
     # Cas 3 (Fallback ultime) : Si la BDD ne répond pas, on extrait le premier chiffre trouvé
-    import re
     match = re.search(r'\d+', project_str)
     if match:
         return int(match.group())
@@ -102,6 +102,8 @@ def _extract_project_id(project_str: str) -> int:
         status_code=404, 
         detail=f"Le projet '{project_str}' est introuvable dans la base de données PostgreSQL."
     )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MODE REST POST (Appelé par ton Spring Boot ou Swagger)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -127,24 +129,31 @@ async def chat_rest(body: ChatRequest):
         if result.get("error"):
             raise HTTPException(status_code=422, detail=result["error"])
 
-        # ── Construire les sources si l'orchestrateur retourne les docs ────
-        sources = []
-        if result.get("docs"):                          # si orchestrate() expose les docs
+        # ── SÉCURISATION ET CONSTRUCION DES SOURCES ───────────────────────────
+        # Évite l'erreur AttributeError: 'str' object has no attribute 'metadata'
+        intent = result.get("intent", "pdf")
+        
+        if intent in ("excel", "staffing"):
+            sources = []  # Pas de recherche sémantique ni de documents structurés FAISS
+        else:
+            # Mode standard (PDF) -> result["docs"] contient des objets Documents LangChain valides
             sources = _build_sources(result["docs"])
-
+            
         return ChatResponse(
             project    = body.project,
             question   = question,
             answer     = result["answer"],
             agent_used = result["agent_used"],
-            intent     = result["intent"],
-            sources    = sources,                       # ← AJOUTER
+            intent     = intent,
+            sources    = sources,
         )
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Erreur chat [{project_id}]: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MODE WEBSOCKET (Streaming en RAM pour Angular)
 # ══════════════════════════════════════════════════════════════════════════════

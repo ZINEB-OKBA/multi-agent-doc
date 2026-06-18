@@ -1,14 +1,17 @@
 """
-services/chat_service.py — VERSION AVEC SOURCES
-─────────────────────────────────────────────────────────────────────────────
+services/chat_service.py — VERSION AVEC MÉMOIRE CONVERSATIONNELLE + HYBRID SEARCH
+─────────────────────────────────────────────────────────────────────────────────────
 Ajouts par rapport à la version précédente :
-  1. stream_response retourne maintenant les sources dans le message "done"
-  2. Le prompt force un rendu Markdown structuré ET cite les sources
+  1. stream_response accepte conversation_history (liste de messages)
+  2. Le prompt RAG inclut l'historique pour que le LLM comprenne le contexte
+  3. hybrid_search boost les chunks contenant des mots-clés de la question
+  4. Les sources sont retournées dans le message "done"
 """
 
 import json
 import logging
 import asyncio
+import re
 from typing import Optional, Dict, List
 import pandas as pd
 
@@ -38,10 +41,10 @@ class WebSocketStreamHandler(AsyncCallbackHandler):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NOUVEAU PROMPT — structure la réponse ET cite les fichiers sources
+# PROMPT AVEC MÉMOIRE CONVERSATIONNELLE
 # ══════════════════════════════════════════════════════════════════════════════
 
-RAG_PROMPT = ChatPromptTemplate.from_template(
+RAG_PROMPT_WITH_MEMORY = ChatPromptTemplate.from_template(
     """Tu es un assistant expert en analyse documentaire. Tu travailles EXCLUSIVEMENT
 à partir des documents fournis dans le contexte ci-dessous.
 
@@ -51,6 +54,8 @@ RÈGLES ABSOLUES :
 1. Ne fabrique JAMAIS d'information absente du contexte.
 2. Cite les valeurs exactes (chiffres, dates, noms, règles).
 3. Si la réponse est incomplète, dis-le clairement.
+4. Si l'information demandée (nom, titre, poste) est présente dans le contexte,
+   tu DOIS la fournir — cherche toutes les occurrences de noms propres et titres.
 
 ══════════════════════════════════════════════
 MISE EN FORME OBLIGATOIRE :
@@ -59,13 +64,15 @@ MISE EN FORME OBLIGATOIRE :
 - Utilise ## pour les sections principales.
 - Utilise des listes à tirets (- item) pour les énumérations.
 - Mets en **gras** les mots-clés, règles et valeurs importantes.
-- Pour les tableaux de données, utilise le format Markdown :
-  | Colonne 1 | Colonne 2 |
-  |-----------|-----------|
-  | valeur    | valeur    |
+- Pour les tableaux de données, utilise le format Markdown.
 - Termine TOUJOURS par une section ## Sources consultées
   listant chaque fichier utilisé sous la forme :
   - 📄 **NomDuFichier** (page X) : [phrase résumant ce qui y a été trouvé]
+
+══════════════════════════════════════════════
+HISTORIQUE DE LA CONVERSATION :
+══════════════════════════════════════════════
+{history}
 
 ══════════════════════════════════════════════
 CONTEXTE DOCUMENTAIRE :
@@ -73,7 +80,7 @@ CONTEXTE DOCUMENTAIRE :
 {context}
 
 ══════════════════════════════════════════════
-QUESTION :
+QUESTION ACTUELLE :
 ══════════════════════════════════════════════
 {question}
 
@@ -81,6 +88,76 @@ Réponds en français. Sois précis, structuré et lisible.
 
 RÉPONSE :"""
 )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HYBRID SEARCH — sémantique + boost par mots-clés
+# ══════════════════════════════════════════════════════════════════════════════
+
+def hybrid_search(vectorstore: FAISS, question: str, k: int = 20) -> list:
+    """
+    Combine recherche sémantique (FAISS) + filtre par mots-clés critiques.
+    Les chunks contenant les mots-clés de la question passent en tête de liste.
+    """
+    # 1. Recherche sémantique large
+    semantic_docs = vectorstore.similarity_search(question, k=k)
+
+    # 2. Extraire les mots-clés : noms propres + mots en majuscules
+    keywords = re.findall(
+        r'\b[A-ZÀ-Ÿ][a-zà-ÿ]{2,}\b|\b[A-ZÀ-Ÿ]{2,}\b',
+        question
+    )
+    # Ajouter aussi les mots courants liés aux personnes/rôles
+    role_keywords = re.findall(
+        r'\b(directeur|gérant|président|fondateur|PDG|DG|responsable|chef|directrice)\b',
+        question,
+        re.IGNORECASE
+    )
+    keywords = list(set(keywords + role_keywords))
+
+    if not keywords:
+        return semantic_docs
+
+    # 3. Trier : docs avec mots-clés en premier
+    keyword_pattern = '|'.join(re.escape(kw) for kw in keywords)
+    boosted = []
+    others = []
+    for doc in semantic_docs:
+        if re.search(keyword_pattern, doc.page_content, re.IGNORECASE):
+            boosted.append(doc)
+        else:
+            others.append(doc)
+
+    logger.info(
+        f"🔍 Hybrid search : {len(boosted)} docs boostés / {len(others)} autres "
+        f"(mots-clés: {keywords})"
+    )
+    return boosted + others
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPER — formate l'historique pour le prompt
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _format_history(conversation_history: List[Dict]) -> str:
+    """
+    Transforme la liste [{role, content}, ...] en texte lisible pour le LLM.
+    On garde les N derniers échanges pour ne pas dépasser la fenêtre de contexte.
+    """
+    MAX_TURNS = 6  # 3 échanges Q/R = 6 messages
+    recent = conversation_history[-MAX_TURNS:] if len(conversation_history) > MAX_TURNS else conversation_history
+
+    if not recent:
+        return "Aucun échange précédent."
+
+    lines = []
+    for msg in recent:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        prefix = "👤 Utilisateur" if role == "user" else "🤖 Assistant"
+        lines.append(f"{prefix} : {content}")
+
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -118,7 +195,6 @@ def _build_sources(docs: list) -> list:
             "extractCount": info["count"],
         })
 
-    # Source la plus utilisée en premier
     return sorted(result, key=lambda s: s["extractCount"], reverse=True)
 
 
@@ -130,16 +206,28 @@ class ChatService:
 
     async def stream_response(
         self,
-        question:    str,
-        project:     str,
-        vectorstore: Optional[FAISS],
-        dataframes:  Optional[Dict[str, pd.DataFrame]],
+        question:             str,
+        project:              str,
+        vectorstore:          Optional[FAISS],
+        dataframes:           Optional[Dict[str, pd.DataFrame]],
         send_fn,
-        force_agent: Optional[str] = None,
+        force_agent:          Optional[str] = None,
+        conversation_history: Optional[List[Dict]] = None,  # ← NOUVEAU
     ):
+        """
+        Point d'entrée principal du chat.
+
+        :param conversation_history: Liste de messages précédents au format
+               [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
+               Le message courant (question) NE doit PAS être dans cette liste.
+        """
         full_text  = ""
         agent_used = ""
-        sources    = []         # ← NOUVEAU
+        sources    = []
+
+        # Valeur par défaut si non fourni
+        if conversation_history is None:
+            conversation_history = []
 
         try:
             intent = force_agent if force_agent in ("pdf", "excel") \
@@ -154,17 +242,18 @@ class ChatService:
             }))
 
             if intent == "pdf":
-                full_text, sources = await self._stream_pdf(question, vectorstore, send_fn)
+                full_text, sources = await self._stream_pdf(
+                    question, vectorstore, send_fn, conversation_history
+                )
             elif intent == "excel":
                 full_text = await self._run_excel(question, dataframes, send_fn)
 
-            # Signal "done" — inclut maintenant les sources
             await send_fn(json.dumps({
                 "type":       "done",
                 "full_text":  full_text,
                 "agent_used": agent_used,
                 "intent":     intent,
-                "sources":    sources,      # ← envoyé à Angular
+                "sources":    sources,
             }))
 
         except Exception as e:
@@ -172,20 +261,27 @@ class ChatService:
             await send_fn(json.dumps({"type": "error", "message": str(e)}))
 
 
-    async def _stream_pdf(self, question: str, vectorstore, send_fn):
-        """Retourne (full_text, sources)."""
+    async def _stream_pdf(
+        self,
+        question:             str,
+        vectorstore,
+        send_fn,
+        conversation_history: List[Dict],
+    ):
+        """Retourne (full_text, sources). Intègre l'historique dans le prompt."""
         if vectorstore is None:
             msg = "⚠️ Aucun document indexé pour ce projet."
             await send_fn(json.dumps({"type": "token", "token": msg}))
             return msg, []
 
-        docs = vectorstore.similarity_search(question, k=5)
+        logger.info(f"🔍 Hybrid search dans le vectorstore (k=20) pour : {question}")
+        docs = hybrid_search(vectorstore, question, k=20)
+
         if not docs:
             msg = "❌ Aucun document pertinent trouvé."
             await send_fn(json.dumps({"type": "token", "token": msg}))
             return msg, []
 
-        # Construire les sources AVANT d'appeler le LLM
         sources = _build_sources(docs)
 
         context = "\n\n---\n\n".join(
@@ -193,10 +289,18 @@ class ChatService:
             for d in docs
         )
 
+        # Formatage de l'historique
+        history_text = _format_history(conversation_history)
+
         handler = WebSocketStreamHandler(send_fn)
-        llm     = get_llm(temperature=0.1, max_tokens=2048, streaming=True, callbacks=[handler])
-        chain   = RAG_PROMPT | llm | StrOutputParser()
-        result  = await chain.ainvoke({"context": context, "question": question})
+        llm     = get_llm(temperature=0, max_tokens=2048, streaming=True, callbacks=[handler])
+        chain   = RAG_PROMPT_WITH_MEMORY | llm | StrOutputParser()
+
+        result = await chain.ainvoke({
+            "context":  context,
+            "question": question,
+            "history":  history_text,   # ← injecté dans le prompt
+        })
 
         return result or "".join(handler.tokens), sources
 

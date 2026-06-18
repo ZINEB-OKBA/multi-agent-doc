@@ -200,7 +200,7 @@ def _chart_cout_mensuel(par_mois: Dict) -> Optional[Dict]:
                 "data": {
                     "labels": mois_sorted,
                     "datasets": [{
-                        "label": "Coût mensuel (€)",
+                        "label": "Coût mensuel (dhs)",
                         "data":  couts,
                         "borderColor": "#534AB7",
                         "backgroundColor": "rgba(83,74,183,0.15)",
@@ -315,7 +315,7 @@ def _chart_tjm_comparatif(par_employe: Dict) -> Optional[Dict]:
                 "data": {
                     "labels": emps,
                     "datasets": [{
-                        "label": "TJM moyen (€/jour)",
+                        "label": "TJM moyen (dhs/jour)",
                         "data": tjms,
                         "backgroundColor": "#534AB7",
                     }]

@@ -3,19 +3,20 @@ import os
 import sys
 from contextlib import asynccontextmanager
 
+# 🌟 ADD THESE TWO LINES AT THE VERY TOP OF YOUR FILE
+# This stops "Could not import module main" dead in its tracks
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers.staffing import router as staffing_router
 
-# Modèles et utilitaires restants
+# Rest of your imports continue exactly as you wrote them...
+from routers.staffing import router as staffing_router
 from models.schemas import HealthResponse
 from utils.llm_factory import test_groq_connection
-
-# Routers épurés (uniquement la gestion Stateless : Documents & Chat)
 from routers.chat import router as chat_router
 from routers.documents import router as documents_router
-
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,

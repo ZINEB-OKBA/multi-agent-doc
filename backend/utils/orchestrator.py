@@ -1,13 +1,16 @@
 """
-utils/orchestrator.py
----------------------
-Orchestrateur Multi-Agent 100% Stateless (RAM) connecté à PostgreSQL.
+utils/orchestrator.py — CLASSIFICATEUR AVEC PRIORITÉ SÉMANTIQUE CORRECTE
+──────────────────────────────────────────────────────────────────────────
+Problème corrigé :
+  - "Décrire l'algorithme des stands" allait vers Excel car "stand" était
+    dans les excel_keywords du fallback → réponse inventée depuis le CSV.
+  - Le mot "stand" (ou tout autre mot métier) ne suffit PAS à forcer Excel.
+  - La priorité correcte est : PDF_FORCE > STAFFING > EXCEL > PDF_DEFAULT
 
-1. Extrait et décode à la volée les fichiers Base64 depuis PostgreSQL.
-2. Génère un index FAISS, des DataFrames Pandas, ou conserve les bytes bruts (docs_raw) en RAM.
-3. Conserve les instances chaudes dans un cache global applicatif.
-4. Classifie l'intention de la question via Llama-3.3-70B.
-5. Route vers l'agent approprié (PDF RAG vs Excel Analyst vs Staffing Agent).
+LOGIQUE FINALE :
+  1. Questions CONCEPTUELLES (décrire, expliquer, comment, algorithme...) → PDF FORCÉ
+  2. Sinon : keyword_fallback par colonnes + mots métier SAUF si contexte sémantique
+  3. Sinon : LLM classificateur avec résumé colonnes
 """
 
 import logging
@@ -29,73 +32,237 @@ from langchain_ollama import OllamaEmbeddings
 
 from utils.llm_factory import get_llm
 from utils.loader_excel import load_dataframe, run_excel_agent
+from utils.rag_cache import RAG_ANSWER_CACHE
 
 logger = logging.getLogger(__name__)
 
-# ── 5. MISE À JOUR DE INTENTTYPE ──────────────────────────────────────────────
 IntentType = Literal["pdf", "excel", "staffing", "unknown"]
-
-# ── REGISTRE GLOBAL EN RAM (CACHE DES PROJETS ACTIFS) ─────────────────────────
 RAM_PROJECTS_CACHE: Dict[int, Dict] = {}
- 
-# ⚙️ Paramètres d'accès PostgreSQL
-DB_HOST = "localhost"
-DB_NAME = "Motuldb"
-DB_USER = "postgres"
+
+DB_HOST     = "localhost"
+DB_NAME     = "Motuldb"
+DB_USER     = "postgres"
 DB_PASSWORD = "postgres"
 
 
-# ── 1. CLASSIFICATEUR D'INTENTION MODIFIÉ ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# LISTES DE MOTS-CLÉS (centralisées ici pour maintenance facile)
+# ══════════════════════════════════════════════════════════════════════════════
 
-INTENT_PROMPT = ChatPromptTemplate.from_template(
-    """Tu es un orchestrateur expert pour un système RAG multi-agent.
-Ta mission est de router la question vers l'agent spécialisé le plus pertinent.
+# Ces mots signalent une question CONCEPTUELLE → réponse dans les PDF/Word
+# Peu importe ce que contient le CSV, un algorithme s'explique dans un document.
+PDF_FORCE_KEYWORDS = [
+    "décrire", "descrire", "décris", "description",
+    "expliquer", "explication", "explique",
+    "algorithme", "algo",
+    "comment fonctionne", "comment est",
+    "architecture", "contexte", "définition", "définir",
+    "qu'est-ce que", "c'est quoi", "kesako",
+    "procédure", "méthode", "méthodologie",
+    "fonctionnement", "principe", "concept",
+    "pourquoi", "objectif", "but", "utilité",
+    "historique", "origine", "présentation",
+    "sfd", "dossier", "documentation", "rapport",
+    "qui est", "quel est le directeur", "quel est le responsable",
+]
 
-### CRITÈRES DE DÉCISION :
-- **staffing** : questions sur des employés, TJM, jours travaillés, coûts RH,
-                 rentabilité d'une ressource humaine, occupation, gain/perte employé.
-                 Exemples : "combien a travaillé Jean ?", "TJM de Marie",
-                 "est-ce que cet employé est rentable ?", "occupation en mars".
-- **excel** : données structurées, tableaux de chiffres, calculs financiers
-                 NON liés aux ressources humaines.
-- **pdf** : explications de concepts, procédures, résumés de textes longs.
+# Ces mots signalent une question sur des DONNÉES CHIFFRÉES → Excel
+# MAIS seulement si aucun mot PDF_FORCE n'est présent.
+EXCEL_DATA_KEYWORDS = [
+    "combien", "nombre", "total", "somme", "moyenne",
+    "maximum", "minimum", "max", "min",
+    "fréquence", "plus fréquent", "top", "classement",
+    "heure de pointe", "peak", "taux",
+    "liste des", "liste complète",
+    "statistiques", "statistique",
+    "calculer", "calcule", "calcul",
+    "quel est le chiffre", "donnez-moi les chiffres",
+    "analyse des données",
+]
 
-Réponds UNIQUEMENT par le mot : `pdf`, `excel` ou `staffing`.
-Question : {question}"""
+# Mots-clés RH/comptables → Staffing (uniquement si calcul explicite demandé)
+STAFFING_FORCE_KEYWORDS = [
+    "tjm", "taux journalier", "jours travaillés", "jours travaillee",
+    "rentabilité", "rentabilite", "profitabilité",
+    "coût salarial", "cout salarial", "charge salariale",
+    "occupation", "taux d'occupation",
+    "gain", "perte", "bénéfice net",
+    "freelancer", "prestataire",
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPER : résumé des DataFrames pour le LLM
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _summarize_dataframes(dataframes: Dict[str, pd.DataFrame]) -> str:
+    if not dataframes:
+        return "Aucun tableau Excel/CSV disponible pour ce projet."
+    lines = []
+    for name, df in dataframes.items():
+        cols = ", ".join(df.columns.tolist()[:15])
+        lines.append(f"  - Fichier '{name}' : {len(df)} lignes, colonnes : [{cols}]")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLASSIFICATEUR PRINCIPAL — logique en couches
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _classify_by_keywords(
+    question: str,
+    dataframes: Dict[str, pd.DataFrame],
+) -> Optional[IntentType]:
+    """
+    Classification rapide SANS appel LLM.
+    Retourne l'intent détecté ou None si non concluant.
+
+    PRIORITÉ (ordre strict) :
+      1. PDF_FORCE  → question conceptuelle, explicative, descriptive
+      2. STAFFING   → calcul RH explicite
+      3. EXCEL      → donnée chiffrée ET colonne correspondante disponible
+      4. None       → laisser le LLM décider
+    """
+    q = question.lower()
+
+    # ── PRIORITÉ 1 : PDF forcé (conceptuel/sémantique) ────────────────────
+    for kw in PDF_FORCE_KEYWORDS:
+        if kw in q:
+            logger.info(f"📚 PDF forcé par mot-clé conceptuel : '{kw}'")
+            return "pdf"
+
+    # ── PRIORITÉ 2 : Staffing ─────────────────────────────────────────────
+    for kw in STAFFING_FORCE_KEYWORDS:
+        if kw in q:
+            logger.info(f"👥 Staffing forcé par mot-clé RH : '{kw}'")
+            return "staffing"
+
+    # ── PRIORITÉ 3 : Excel — SEULEMENT si données chiffrées demandées ─────
+    # Condition A : un mot Excel_DATA est présent
+    has_data_kw = any(kw in q for kw in EXCEL_DATA_KEYWORDS)
+
+    # Condition B : un nom de colonne du DataFrame apparaît dans la question
+    col_match = None
+    if dataframes:
+        all_cols = set()
+        for df in dataframes.values():
+            for col in df.columns:
+                normalized = col.lower().replace("_", " ")
+                all_cols.add(normalized)
+                all_cols.add(col.lower())
+        for col in all_cols:
+            if len(col) > 3 and col in q:
+                col_match = col
+                break
+
+    if has_data_kw and (col_match or dataframes):
+        logger.info(
+            f"📊 Excel par mots-clés données "
+            f"(data_kw=True, col_match={col_match})"
+        )
+        return "excel"
+
+    if col_match and not has_data_kw:
+        # Colonne trouvée mais pas de mot chiffré → ambigu, laisser le LLM décider
+        logger.info(f"⚠️ Colonne '{col_match}' trouvée mais question ambiguë → LLM")
+        return None
+
+    return None
+
+
+# ── Prompt LLM classificateur (fallback si keyword insuffisant) ───────────────
+
+INTENT_PROMPT_LLM = ChatPromptTemplate.from_template(
+    """Tu es l'orchestrateur d'un système IA multi-agent.
+Ta mission : router la question vers le bon agent.
+
+════════════════════════════════════════
+DONNÉES EXCEL/CSV DISPONIBLES :
+{dataframes_summary}
+════════════════════════════════════════
+
+RÈGLES (ordre de priorité strict) :
+
+1. **pdf** : Question conceptuelle, explicative, procédurale, historique, ou administrative.
+   La réponse se trouve dans un document texte (PDF, Word).
+   → "décrire", "expliquer", "algorithme", "comment fonctionne", "qui est", "procédure",
+     "architecture", "qu'est-ce que", "présentation", "documentation".
+   → MÊME SI la question mentionne un mot qui existe dans le tableau Excel (ex: "stand",
+     "terminal"), si elle demande une EXPLICATION ou une DESCRIPTION → **pdf**.
+
+2. **excel** : Question sur des données quantitatives, statistiques ou des listes de données.
+   La réponse est un calcul ou une extraction depuis les colonnes du tableau.
+   → "combien", "total", "moyenne", "heure de pointe", "liste des", "fréquence", "maximum".
+
+3. **staffing** : Calcul RH explicite (TJM, rentabilité, jours travaillés, coût salarial).
+
+EXEMPLES :
+- "Décrire l'algorithme de planification des stands" → **pdf** (question explicative)
+- "Quels stands acceptent les A380 ?" → **excel** (extraction de données)
+- "Heure de pointe par terminal" → **excel** (statistique)
+- "Quelle est la procédure d'attribution des stands ?" → **pdf** (procédure)
+- "Combien de stands sont au terminal T2 ?" → **excel** (comptage)
+- "Qui est le directeur ?" → **pdf** (information administrative)
+
+Réponds UNIQUEMENT par : `pdf`, `excel` ou `staffing`.
+
+Question : {question}
+Réponse :"""
 )
 
-def classify_intent(question: str) -> IntentType:
-    """Utilise Llama-3.3-70B pour router la demande vers l'agent PDF, Excel ou Staffing."""
-    logger.info(f"🧭 Classification de l'intention : '{question[:80]}'")
-    llm = get_llm(temperature=0.0, max_tokens=10)
-    chain = INTENT_PROMPT | llm | StrOutputParser()
-    result = chain.invoke({"question": question}).strip().lower()
-    
-    if "staffing" in result:
-        intent = "staffing"
-    elif "excel" in result:
-        intent = "excel"
-    else:
+
+def classify_intent(
+    question:   str,
+    dataframes: Optional[Dict[str, pd.DataFrame]] = None,
+) -> IntentType:
+    """
+    Classificateur complet en deux passes :
+    1. Keyword rapide (sans LLM)
+    2. LLM avec contexte colonnes (si keyword non concluant)
+    """
+    logger.info(f"🧭 Classification : '{question[:80]}'")
+
+    # Passe 1 : mots-clés (gratuit, instantané)
+    intent = _classify_by_keywords(question, dataframes or {})
+    if intent is not None:
+        logger.info(f"   → Intent (keywords) : {intent}")
+        return intent
+
+    # Passe 2 : LLM avec contexte des colonnes
+    logger.info("   → Aucun keyword concluant, appel LLM classificateur...")
+    df_summary = _summarize_dataframes(dataframes or {})
+    try:
+        llm = get_llm(temperature=0.0, max_tokens=5)
+        chain = INTENT_PROMPT_LLM | llm | StrOutputParser()
+        result_str = chain.invoke({
+            "question":           question,
+            "dataframes_summary": df_summary,
+        }).strip().lower()
+
+        if "staffing" in result_str:
+            intent = "staffing"
+        elif "excel" in result_str:
+            intent = "excel"
+        else:
+            intent = "pdf"
+
+    except Exception as e:
+        logger.error(f"❌ LLM classificateur échoué, repli PDF : {e}")
         intent = "pdf"
-        
-    logger.info(f"   → Intention retenue : {intent}")
+
+    logger.info(f"   → Intent (LLM) : {intent}")
     return intent
 
 
-# ── 2. EXTRACTEUR STATELESS DIRECT DEPUIS POSTGRESQL MODIFIÉ ──────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# EXTRACTEUR POSTGRESQL → RAM
+# ══════════════════════════════════════════════════════════════════════════════
 
 def rebuild_resources_from_postgres(project_id: int):
-    """
-    Se connecte à PostgreSQL, télécharge les chaînes Base64 du projet,
-    nettoie les en-têtes Data URL (data:...;base64,), décode le flux en mémoire
-    et initialise les structures de données volatiles (RAM), y compris docs_raw.
-    """
-    logger.info(f"🔄 [BDD ➔ RAM] Extraction et reconstruction de la base documentaire pour le projet ID: {project_id}")
-    
-    conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD)
+    logger.info(f"🔄 [BDD ➔ RAM] Projet {project_id}")
+
+    conn   = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD)
     cursor = conn.cursor(cursor_factory=RealDictCursor)
-    
-    # Récupération des documents indexés du projet
     cursor.execute(
         "SELECT file_name, content FROM documents WHERE project_id = %s AND is_indexed = TRUE;",
         (project_id,)
@@ -105,46 +272,39 @@ def rebuild_resources_from_postgres(project_id: int):
     conn.close()
 
     if not db_docs:
-        logger.warning(f"⚠️ Aucun document marqué 'is_indexed = TRUE' en BDD pour le projet ID {project_id}")
+        logger.warning(f"⚠️ Aucun document indexé pour le projet {project_id}")
         return None, {}, []
 
-    all_chunks: List[Document] = []
-    dataframes: Dict[str, pd.DataFrame] = {}
-    docs_raw: List[Dict[str, Any]] = []
+    all_chunks:  List[Document]       = []
+    dataframes:  Dict[str, pd.DataFrame] = {}
+    docs_raw:    List[Dict[str, Any]] = []
 
     for doc in db_docs:
-        file_name = doc['file_name']
+        file_name      = doc['file_name']
         base64_content = doc['content']
-        suffix = os.path.splitext(file_name)[1].lower()
+        suffix         = os.path.splitext(file_name)[1].lower()
 
         if not base64_content:
             continue
 
-        # Nettoyage des headers "data:...;base64," via Regex
         if ";base64," in base64_content:
             base64_content = re.sub(r'^data:.*?;base64,', '', base64_content)
         elif "," in base64_content:
             base64_content = base64_content.split(",")[1]
-
-        # Nettoyage des espaces ou retours à la ligne parasites
         base64_content = base64_content.strip()
 
-        # Création du fichier temporaire volatile
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             try:
                 file_bytes_decoded = base64.b64decode(base64_content)
                 tmp.write(file_bytes_decoded)
                 temp_filepath = tmp.name
-                
-                # Enregistrement des bytes bruts pour le Staffing
                 docs_raw.append({
-                    "file_name": file_name,
+                    "file_name":  file_name,
                     "file_bytes": file_bytes_decoded,
-                    "suffix": suffix,
+                    "suffix":     suffix,
                 })
-                
             except Exception as decode_err:
-                logger.error(f"❌ Échec du décodage Base64 pour '{file_name}' : {decode_err}")
+                logger.error(f"❌ Décodage Base64 : '{file_name}' : {decode_err}")
                 continue
 
         try:
@@ -155,104 +315,110 @@ def rebuild_resources_from_postgres(project_id: int):
                     for chunk in chunks:
                         chunk.metadata["source"] = file_name
                     all_chunks.extend(chunks)
-                    logger.info(f"✅ Chunks RAM extraits pour le document textuel : {file_name}")
+                    logger.info(f"✅ Chunks PDF/Word : {file_name}")
                 else:
-                    logger.warning(f"⚠️ Le fichier {file_name} n'a généré aucun contenu exploitable.")
-                
+                    logger.warning(f"⚠️ Aucun contenu extrait de {file_name}")
+
             elif suffix in (".csv", ".xlsx", ".xls", ".xlsm"):
                 dataframes[os.path.splitext(file_name)[0]] = load_dataframe(temp_filepath)
-                logger.info(f"✅ DataFrame RAM initialisé pour le tableau : {file_name}")
+                logger.info(f"✅ DataFrame Excel/CSV : {file_name}")
+
         except Exception as process_err:
-            logger.error(f"❌ Erreur lors du traitement du fichier temporaire {file_name} : {process_err}")
+            logger.error(f"❌ Traitement {file_name} : {process_err}")
         finally:
             if os.path.exists(temp_filepath):
-                os.unlink(temp_filepath)  # 🗑️ Suppression immédiate
+                os.unlink(temp_filepath)
 
-    # Montage du VectorStore FAISS éphémère en RAM
     vectorstore = None
     if all_chunks:
-        logger.info(f"🔢 Vectorisation en RAM de {len(all_chunks)} chunks via Ollama...")
-        embeddings = OllamaEmbeddings(model="nomic-embed-text")
+        logger.info(f"🔢 Vectorisation {len(all_chunks)} chunks...")
+        embeddings  = OllamaEmbeddings(model="nomic-embed-text")
         vectorstore = FAISS.from_documents(all_chunks, embeddings)
-        logger.info("✅ Index FAISS temporaire créé avec succès en RAM.")
+        logger.info("✅ Index FAISS créé en RAM.")
 
-    # Enregistrement dans le cache RAM
     RAM_PROJECTS_CACHE[project_id] = {
         "vectorstore": vectorstore,
-        "dataframes": dataframes,
-        "docs_raw": docs_raw,
-        "updated_at": datetime.now()
+        "dataframes":  dataframes,
+        "docs_raw":    docs_raw,
+        "updated_at":  datetime.now(),
     }
     return vectorstore, dataframes, docs_raw
 
 
 def get_project_resources(project_id: int):
-    """
-    Fonction ultra-rapide pour le chat.
-    Récupère directement depuis la RAM sans toucher à PostgreSQL ni recalculer les embeddings.
-    """
     if project_id in RAM_PROJECTS_CACHE:
-        logger.info(f"⚡ [CACHE RAM HIT] Récupération instantanée du contexte projet {project_id}")
+        logger.info(f"⚡ [RAM HIT] Projet {project_id}")
         res = RAM_PROJECTS_CACHE[project_id]
         return res["vectorstore"], res["dataframes"], res.get("docs_raw", [])
-    
-    logger.info(f"📡 [CACHE RAM MISS] Première initialisation requise pour le projet {project_id}")
+    logger.info(f"📡 [RAM MISS] Init projet {project_id}")
     return rebuild_resources_from_postgres(project_id)
 
 
-# ── 3. AGENT PDF (RAG EN MÉMOIRE) ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# AGENTS
+# ══════════════════════════════════════════════════════════════════════════════
 
 RAG_PROMPT = ChatPromptTemplate.from_template(
-    """Tu es un assistant expert en extraction et analyse documentaire.
-Tu doit extraire les informations demandées avec une fidélité absolue, sans rien inventer ni généraliser.
+    """Tu es un assistant expert en extraction documentaire factuelle.
 
-⚠️ DIRECTIVES STRICTES DE MISE EN FORME :
-1. Présente TOUJOURS tes réponses de manière aérée et hautement lisible.
-2. Utilise des titres Markdown clairs (## pour les sections principales, ### pour les sous-sections).
-3. Structure tes explications avec des listes à puces aérées ou des tableaux Markdown.
-4. Intègre des émojis contextuels et pertinents au début des titres et des points clés pour guider l'œil.
-5. Mets en gras (**Texte**) les concepts, règles de gestion et champs obligatoires critiques.
+⚠️ RÈGLES STRICTES :
+1. Si la question demande un NOM DE PERSONNE (directeur, responsable, fondateur, président...),
+   cherche EXPLICITEMENT dans le contexte toute occurrence de nom propre et cite-le EXACTEMENT.
+2. Si l'information est présente dans le contexte, tu DOIS la fournir.
+3. Si l'information est ABSENTE du contexte, réponds :
+   "❌ L'information demandée n'est pas accessible dans les extraits actuels du document."
+4. Ne fabrique jamais de nom ou d'information.
 
-CONTEXTE DE SPÉCIFICATION :
+CONTEXTE :
 {context}
 
-QUESTION :
-{question}
+QUESTION : {question}
 
-RÉPONSE FORMATEE EN MARKDOWN CORRETE :"""
+RÉPONSE DIRECTE :"""
 )
 
+
+def hybrid_search(vectorstore, question: str, k: int = 20) -> list:
+    semantic_docs = vectorstore.similarity_search(question, k=k)
+    keywords  = re.findall(r'\b[A-ZÀ-Ÿ][a-zà-ÿ]{2,}\b|\b[A-ZÀ-Ÿ]{2,}\b', question)
+    role_kws  = re.findall(
+        r'\b(directeur|gérant|président|fondateur|PDG|DG|responsable|chef|directrice)\b',
+        question, re.IGNORECASE
+    )
+    keywords = list(set(keywords + role_kws))
+    if not keywords:
+        return semantic_docs
+    pattern = '|'.join(re.escape(kw) for kw in keywords)
+    boosted, others = [], []
+    for doc in semantic_docs:
+        (boosted if re.search(pattern, doc.page_content, re.IGNORECASE) else others).append(doc)
+    logger.info(f"🔍 Hybrid search : {len(boosted)} boostés / {len(others)} autres")
+    return boosted + others
+
+
 def run_pdf_agent(question: str, docs: List[Document]) -> str:
-    """Reçoit les documents pré-extraits par l'orchestrateur et génère la réponse finale via le LLM."""
-    logger.info(f"📄 Agent PDF activé avec {len(docs)} documents sources.")
-    
+    logger.info(f"📄 Agent PDF : {len(docs)} docs")
     context = "\n\n---\n\n".join(
         [f"📄 Source : {d.metadata.get('source', 'Inconnu')}\n{d.page_content}" for d in docs]
     )
-    logger.info(f"   → Contexte assemblé : {len(context)} caractères")
-
-    llm = get_llm(temperature=0.1, max_tokens=2048)
+    llm   = get_llm(temperature=0, max_tokens=2048)
     chain = RAG_PROMPT | llm | StrOutputParser()
     answer = chain.invoke({"context": context, "question": question})
-    logger.info(f"✅ Réponse PDF générée ({len(answer)} caractères)")
+    logger.info(f"✅ Réponse PDF ({len(answer)} chars)")
     return answer
 
 
 def get_staffing_docs_raw_from_postgres(project_id: int) -> list:
-    """
-    Lit UNIQUEMENT les fichiers staffing depuis la table staffing_documents.
-    Décode le base64 en bytes directement en RAM — rien sur le disque.
-    """
-    logger.info(f"📂 [Staffing BDD→RAM] Lecture des fichiers staffing projet {project_id}")
-    
+    logger.info(f"📂 [Staffing] Projet {project_id}")
     conn   = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD)
     cursor = conn.cursor(cursor_factory=RealDictCursor)
-    
     cursor.execute(
-        """SELECT file_name, content, extension
-           FROM staffing_documents
+        """SELECT file_name, content FROM documents
            WHERE project_id = %s
-           ORDER BY uploaded_at DESC;""",
+             AND (file_name ILIKE '%%staffing%%'
+                  OR file_name ILIKE '%%freelancer%%'
+                  OR file_name LIKE '%%.csv'
+                  OR file_name LIKE '%%.xlsx');""",
         (project_id,)
     )
     rows = cursor.fetchall()
@@ -263,119 +429,118 @@ def get_staffing_docs_raw_from_postgres(project_id: int) -> list:
     for row in rows:
         file_name = row["file_name"]
         content   = row["content"] or ""
-        suffix    = row["extension"] or os.path.splitext(file_name)[1].lower()
-        if not suffix.startswith("."): suffix = f".{suffix}"
-
-        # Nettoyer le préfixe data-URL
+        suffix    = os.path.splitext(file_name)[1].lower()
         if ";base64," in content:
             pure = re.sub(r'^data:.*?;base64,', '', content)
         elif "," in content:
             pure = content.split(",")[1]
         else:
             pure = content
-
         pure = pure.strip().replace(" ", "").replace("\n", "")
-
         try:
             file_bytes = base64.b64decode(pure)
-            docs_raw.append({
-                "file_name":  file_name,
-                "file_bytes": file_bytes,   # bytes en RAM, jamais écrits sur disque
-                "suffix":     suffix,
-            })
-            logger.info(f"✅ Décodé en RAM : {file_name} ({len(file_bytes):,} bytes)")
+            docs_raw.append({"file_name": file_name, "file_bytes": file_bytes, "suffix": suffix})
+            logger.info(f"✅ Décodé : {file_name} ({len(file_bytes):,} bytes)")
         except Exception as e:
-            logger.error(f"❌ Erreur décodage '{file_name}': {e}")
+            logger.error(f"❌ Décodage '{file_name}': {e}")
 
-    logger.info(f"📊 {len(docs_raw)} fichier(s) staffing chargés en RAM")
+    logger.info(f"📊 {len(docs_raw)} fichier(s) staffing en RAM")
     return docs_raw
 
 
-# ── 4. ORCHESTRATEUR PRINCIPAL UNIFIÉ AVEC LE ROUTAGE STAFFING ────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ORCHESTRATEUR PRINCIPAL
+# ══════════════════════════════════════════════════════════════════════════════
 
 def orchestrate(
-    question: str,
-    project_id: int,
+    question:    str,
+    project_id:  int,
     force_agent: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Point d'entrée de l'orchestrateur. Consomme les structures en RAM, route
-    vers le bon agent (PDF, Excel, Staffing) et extrait les sources et graphiques nécessaires.
-    """
+
     result = {
         "agent_used": None,
-        "intent": None,
-        "answer": "",
-        "error": None,
-        "docs": [],
-        "charts": [],   # Initialisation pour accueillir les graphiques de l'agent staffing
-        "sources": []   # Initialisation pour accueillir les métadonnées de sources du staffing
+        "intent":     None,
+        "answer":     "",
+        "error":      None,
+        "docs":       [],
+        "charts":     [],
+        "sources":    [],
+        "from_cache": False,
     }
 
+    # 1. Cache
+    cached = RAG_ANSWER_CACHE.get(question=question, project_id=project_id)
+    if cached:
+        logger.info(f"⚡ Cache hit (projet {project_id})")
+        result.update(cached)
+        return result
+
     try:
-        # 1. Récupération immédiate depuis le registre RAM ou reconstruction automatique
+        # 2. Ressources RAM
         vectorstore, dataframes, docs_raw = get_project_resources(project_id)
 
-        # 2. Routage intelligent ou forcé
-        intent = force_agent if force_agent in ("pdf", "excel", "staffing") else classify_intent(question)
-        result["intent"] = intent
+        # 3. Routage
+        if force_agent and force_agent.strip().lower() in ("pdf", "excel", "staffing"):
+            intent = force_agent.strip().lower()
+            logger.info(f"🎯 Agent forcé : {intent}")
+        else:
+            # classify_intent reçoit les dataframes pour le contexte colonnes
+            intent = classify_intent(question, dataframes)
 
-        # 3. Traitement selon l'intention identifiée
+        result["intent"] = intent
+        logger.info(f"🚦 Routage → Agent : {intent.upper()}")
+
+        # 4. Exécution agent
         if intent == "pdf":
             if vectorstore is None:
-                result["error"] = "⚠️ Aucun document textuel (PDF/Word) indexé trouvé en BDD pour ce projet."
+                result["error"] = "⚠️ Aucun document PDF/Word indexé pour ce projet."
                 return result
-            
-            result["agent_used"] = "Agent PDF (RAG Stateless en RAM)"
-            docs = vectorstore.similarity_search(question, k=5)
-            result["docs"] = docs
-            
-            if not docs:
-                result["answer"] = "Aucun document pertinent trouvé dans l'index FAISS éphémère."
-            else:
-                result["answer"] = run_pdf_agent(question, docs)
+            result["agent_used"] = "Agent PDF (RAG FAISS en RAM)"
+            docs = hybrid_search(vectorstore, question, k=20)
+            result["docs"]   = docs
+            result["answer"] = run_pdf_agent(question, docs) if docs else \
+                               "Aucun document pertinent trouvé dans l'index."
 
         elif intent == "excel":
             if not dataframes:
-                result["error"] = "⚠️ Aucun tableau de données (Excel/CSV) indexé trouvé en BDD pour ce projet."
+                result["error"] = "⚠️ Aucun fichier Excel/CSV indexé pour ce projet."
                 return result
-            
             result["agent_used"] = "Agent Excel (Pandas en RAM)"
-            result["answer"] = run_excel_agent(question, dataframes)
-            result["docs"] = list(dataframes.keys()) 
+            result["answer"]     = run_excel_agent(question, dataframes)
+            result["docs"]       = list(dataframes.keys())
 
-        # ── 4. BLOC DE ROUTAGE CORRIGÉ POUR L'AGENT STAFFING ───────────────────
         elif intent == "staffing":
             from agents.staffing_agent import run_staffing_agent
-
-            # Lire depuis staffing_documents (pas documents) — tout en RAM depuis PostgreSQL
-            docs_raw = get_staffing_docs_raw_from_postgres(project_id)
-
-            if not docs_raw:
-                result["error"] = "⚠️ Aucun fichier dans staffing_documents pour ce projet."
+            docs_raw_staffing = get_staffing_docs_raw_from_postgres(project_id)
+            if not docs_raw_staffing:
+                result["error"]  = "⚠️ Aucun fichier staffing trouvé."
                 result["answer"] = result["error"]
                 return result
-
-            staffing_result = run_staffing_agent(
-                question=question,
-                docs_raw=docs_raw,
-            )
-
+            staffing_result = run_staffing_agent(question=question, docs_raw=docs_raw_staffing)
             if staffing_result.get("error"):
-                result["error"] = staffing_result["error"]
+                result["error"]  = staffing_result["error"]
                 result["answer"] = staffing_result["error"]
             else:
-                result["agent_used"] = "Agent Staffing (Base64 PostgreSQL → RAM → Calculs → Graphiques)"
-                result["answer"] = staffing_result["answer"]
-                result["docs"] = []
-                result["charts"] = staffing_result.get("charts", [])
-                result["sources"] = staffing_result.get("sources", [])
-
+                result["agent_used"] = "Agent Staffing (PostgreSQL → RAM → Calculs)"
+                result["answer"]     = staffing_result["answer"]
+                result["charts"]     = staffing_result.get("charts", [])
+                result["sources"]    = staffing_result.get("sources", [])
         else:
             result["error"] = "❌ Intention non reconnue."
 
+        # 5. Mise en cache si réponse valide
+        if result["answer"] and not result.get("error"):
+            ok = RAG_ANSWER_CACHE.set(
+                question=question, project_id=project_id,
+                answer=result["answer"], sources=result.get("sources", []),
+                charts=result.get("charts", []),
+                agent_used=result.get("agent_used", ""), intent=intent,
+            )
+            logger.info(f"{'💾 Mis en cache' if ok else '🚫 Non mis en cache'}")
+
     except Exception as e:
-        logger.error(f"❌ Erreur critique dans l'orchestrateur : {e}", exc_info=True)
+        logger.error(f"❌ Erreur orchestrateur : {e}", exc_info=True)
         result["error"] = f"❌ Erreur interne : {str(e)}"
 
     return result
